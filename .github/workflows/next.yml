@@ -1,0 +1,294 @@
+# Builds the `next` branch of this fork: kapicorp/krab main (NEXT_SOURCE) plus
+# the open pull requests of NEXT_AUTHOR, and those of NEXT_GREEN_AUTHORS such as
+# dependabot[bot] once all their checks passed, merged in PR number order. A PR
+# that conflicts is skipped. This workflow, Dockerfile and .dockerignore are the
+# fork's own files and are carried over from the previous next on every
+# rebuild. The issue titled "next: integration status" lists what is in next.
+# next and its image contain unreviewed changes and are for testing only.
+# Spec: https://github.com/kadet-hub/registry/blob/main/docs/specs/krab-next.md
+name: next
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: next
+  cancel-in-progress: false
+
+env:
+  SOURCE: ${{ vars.NEXT_SOURCE }}
+  AUTHOR: ${{ vars.NEXT_AUTHOR }}
+  GREEN_AUTHORS: ${{ vars.NEXT_GREEN_AUTHORS }}
+  OWN_FILES: .github/workflows/next.yml Dockerfile .dockerignore
+
+jobs:
+  assemble:
+    name: assemble next
+    if: vars.NEXT_SOURCE != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      sha: ${{ steps.merge.outputs.sha }}
+      base: ${{ steps.merge.outputs.base }}
+      merged: ${{ steps.merge.outputs.merged }}
+      conflicting: ${{ steps.merge.outputs.conflicting }}
+    steps:
+      # Merged upstream PRs that change workflow files are new commits here, and
+      # GitHub refuses to take them from GITHUB_TOKEN, which can't have the
+      # `workflows` permission. A GitHub App installed on this repository
+      # pushes instead: its client ID in the variable NEXT_APP_CLIENT_ID and
+      # its key in the secret NEXT_APP_PRIVATE_KEY.
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.NEXT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEXT_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write
+
+      # The push below needs the credentials, and this job uploads no artifact.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }} # zizmor: ignore[artipacked]
+
+      - id: merge
+        name: merge pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          source_url="https://github.com/$SOURCE.git"
+
+          gh api --paginate "repos/$SOURCE/pulls?state=open&per_page=100" | jq -s 'add' >"$RUNNER_TEMP/open.json"
+          jq -r --arg author "$AUTHOR" '.[] | select(.user.login == $author) | "\(.number) \(.head.sha)"' \
+            "$RUNNER_TEMP/open.json" >"$RUNNER_TEMP/selected.txt"
+
+          # PRs by NEXT_GREEN_AUTHORS only once every check on their head passed.
+          # This runs before the fingerprint, so a PR turning green changes it.
+          # shellcheck disable=SC2016 # jq programs, not shell expansions
+          jq -r --arg authors "$GREEN_AUTHORS" \
+            '.[] | select(.user.login as $l | $authors | split(" ") | index($l)) | "\(.number) \(.head.sha)"' \
+            "$RUNNER_TEMP/open.json" | while read -r number sha; do
+              state=$(gh pr view "$number" -R "$SOURCE" --json statusCheckRollup --jq \
+                '[.statusCheckRollup[] | (.conclusion // .state)] as $s
+                 | if ($s | length) > 0 and all($s[]; . == "SUCCESS" or . == "SKIPPED" or . == "NEUTRAL")
+                   then "green" else "not green" end')
+              if [[ "$state" == green ]]; then echo "$number $sha"; fi
+            done >>"$RUNNER_TEMP/selected.txt"
+          sort -n -u "$RUNNER_TEMP/selected.txt" >"$RUNNER_TEMP/prs.txt"
+
+          own=$(for f in $OWN_FILES; do git rev-parse "$GITHUB_SHA:$f"; done | tr '\n' ' ')
+          git fetch -q "$source_url" main
+          git switch -q --detach FETCH_HEAD
+          base=$(git rev-parse HEAD)
+          fingerprint="$base $own$(tr '\n' ' ' <"$RUNNER_TEMP/prs.txt")"
+          previous=
+          if git fetch -q origin next 2>/dev/null; then
+            previous=$(git log -1 --format=%B FETCH_HEAD | sed -n 's/^Next-Fingerprint: //p')
+          fi
+          if [[ "$fingerprint" == "$previous" ]]; then
+            echo "Nothing changed since next was last built." >>"$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          merged=() conflicting=()
+          while read -r number sha; do
+            git fetch -q "$source_url" "pull/$number/head"
+            if [[ "$(git rev-parse FETCH_HEAD)" != "$sha" ]]; then
+              echo "::warning::#$number moved while assembling, taking $(git rev-parse --short FETCH_HEAD)"
+            fi
+            if git merge -q --no-ff --no-edit -m "Merge $SOURCE#$number into next" FETCH_HEAD; then
+              merged+=("#$number")
+            else
+              git merge --abort
+              conflicting+=("#$number")
+            fi
+          done <"$RUNNER_TEMP/prs.txt"
+
+          # next is the default branch, which scheduled runs start from, and
+          # nothing upstream carries these files, so the commit this run
+          # started on is their only source. Its version replaces any that main
+          # or a merged PR brings, so the image build matches this workflow.
+          # shellcheck disable=SC2086 # OWN_FILES is a list of paths
+          git checkout "$GITHUB_SHA" -- $OWN_FILES
+          git commit -q --allow-empty -m "next: $SOURCE main ${base::12} with ${#merged[@]} pull requests" \
+            -m "Merged: ${merged[*]:-none}" -m "Conflicting: ${conflicting[*]:-none}" \
+            -m "Next-Fingerprint: $fingerprint"
+          git push -q --force origin HEAD:refs/heads/next
+
+          {
+            echo "## next at $(git rev-parse --short HEAD)"
+            echo "Merged: ${merged[*]:-none}"
+            echo
+            echo "Conflicting with main or an earlier PR, left out: ${conflicting[*]:-none}"
+          } >>"$GITHUB_STEP_SUMMARY"
+          {
+            echo "changed=true"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "base=$base"
+            echo "merged=${merged[*]:-}"
+            echo "conflicting=${conflicting[*]:-}"
+          } >>"$GITHUB_OUTPUT"
+
+  test:
+    name: cargo test on next
+    needs: assemble
+    if: needs.assemble.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.assemble.outputs.sha }}
+          persist-credentials: false
+      # The Python packages of the test job in kapicorp/krab ci.yml, on the
+      # python3 of the image's Debian. rustup installs the toolchain of
+      # rust-toolchain.toml on the first cargo call.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install pyyaml "omegaconf==2.4.0.dev3" kadet jinja2 "python-box>=7.2.0,<8"
+      - run: cargo test --locked
+
+  image:
+    name: image
+    # Only a build whose tests passed moves the next image tags.
+    needs: [assemble, test]
+    if: needs.assemble.outputs.changed == 'true' && needs.test.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      # Build provenance: users verify where the image was built with
+      # `gh attestation verify oci://<image>@<digest> --owner <owner>`.
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image: ${{ steps.names.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.assemble.outputs.sha }}
+          persist-credentials: false
+      # The Dockerfile copies bin/amd64/krab. The runner's glibc 2.39 is older
+      # than the 2.41 of debian:trixie-slim, so the binary runs there.
+      - run: |
+          cargo build --release --locked -p krab
+          install -D target/release/krab bin/amd64/krab
+      - id: names
+        env:
+          SHA: ${{ needs.assemble.outputs.sha }}
+        run: |
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          echo "image=ghcr.io/$owner/krab" >>"$GITHUB_OUTPUT"
+          echo "sha=${SHA::12}" >>"$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.assemble.outputs.sha }}
+            org.opencontainers.image.description=krab main plus open pull requests, see the next workflow. Unreviewed, for testing only.
+          tags: |
+            ${{ steps.names.outputs.image }}:next
+            ${{ steps.names.outputs.image }}:next-${{ steps.names.outputs.sha }}
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.names.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false # needs artifact-metadata: write
+
+  report:
+    name: update the status issue
+    needs: [assemble, test, image]
+    if: always() && needs.assemble.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ needs.assemble.outputs.sha }}
+          BASE: ${{ needs.assemble.outputs.base }}
+          MERGED: ${{ needs.assemble.outputs.merged }}
+          CONFLICTING: ${{ needs.assemble.outputs.conflicting }}
+          TESTS: ${{ needs.test.result }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          title="next: integration status"
+          rows() {
+            for pr in $1; do
+              # shellcheck disable=SC2016 # a jq program, not a shell expansion
+              gh api "repos/$SOURCE/pulls/${pr#\#}" \
+                --jq '"| [#\(.number)](\(.html_url)) | \(.title | gsub("[|]"; "/")) | \(.user.login) | `\(.head.sha[0:12])` |"'
+            done
+          }
+          {
+            echo "This issue is updated by the \`next\` workflow. \`next\` is \`$SOURCE\` \`main\` plus open pull requests merged on top. It contains unreviewed changes, so use it for testing only. Spec: https://github.com/kadet-hub/registry/blob/main/docs/specs/krab-next.md"
+            echo
+            echo "- Branch: [\`next\`](https://github.com/$REPO/tree/next) at \`${SHA::12}\`, on \`main\` \`${BASE::12}\`"
+            if [[ -n "$DIGEST" ]]; then
+              echo "- Image: \`$IMAGE:next-${SHA::12}\` (\`$DIGEST\`)"
+            else
+              echo "- Image: not built in this run, because the tests did not pass; the next tag still points to the previous build"
+            fi
+            echo "- cargo test: $TESTS"
+            echo "- Run: $RUN"
+            echo
+            echo "### Merged"
+            echo
+            if [[ -n "$MERGED" ]]; then
+              echo "| PR | Title | Author | Head |"
+              echo "|---|---|---|---|"
+              rows "$MERGED"
+            else
+              echo "None."
+            fi
+            echo
+            echo "### Left out because they conflict with main or an earlier PR"
+            echo
+            if [[ -n "$CONFLICTING" ]]; then
+              echo "| PR | Title | Author | Head |"
+              echo "|---|---|---|---|"
+              rows "$CONFLICTING"
+            else
+              echo "None."
+            fi
+          } >body.md
+          number=$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number,title |
+            jq -r --arg t "$title" '[.[] | select(.title == $t)][0].number // empty')
+          if [[ -z "$number" ]]; then
+            number=$(gh api -q .number "repos/$REPO/issues" -f title="$title" -F body=@body.md)
+          else
+            gh issue edit "$number" -R "$REPO" --body-file body.md >/dev/null
+          fi
+          echo "Status issue: https://github.com/$REPO/issues/$number" >>"$GITHUB_STEP_SUMMARY"
