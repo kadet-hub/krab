@@ -64,8 +64,8 @@ SRV-4  When the daemon cannot be reached or started, a command that has a
 
 SRV-5  The daemon path and the local path MUST give identical results for
        the same inventory and command.
-       Test: none
-       Since: b3c122e
+       Test: crates/krab/tests/daemon_equals_local.rs::the_daemon_answers_like_no_daemon (partial: the steps it lists)
+       Since: b3c122e, #306
 
 SRV-6  The client MUST start the daemon as `<current exe> server run
        --inventory-path <root> --idle-timeout 1800` in a new session
@@ -156,6 +156,12 @@ SRV-17 The log file MUST be `$XDG_STATE_HOME/krab/server-<inventory>.log`
        unset). Every build's daemon for the inventory appends to it.
        Test: none
        Since: b3c122e
+
+SRV-49 The socket key MUST cover the working directory as well as the
+       inventory: a daemon reads `.kapitan` and resolves relative paths from
+       the directory it was started in, so a client elsewhere needs its own.
+       Test: crates/krab/tests/daemon_equals_local.rs::the_daemon_answers_like_no_daemon (the "start the daemon from inventory/" step)
+       Since: #306
 ```
 
 ### Start-up
@@ -212,6 +218,13 @@ SRV-23 `inventory.targets` and `inventory.all` given `labels` MUST return
        pair; without `labels` (or with null params) they return all targets.
        Test: none
        Since: 000035c
+
+SRV-48 When the targets cannot be listed (two files with one name, no
+       targets/), the daemon MUST keep the previous targets and answer every
+       inventory request except inventory.wait with that error, as
+       --no-daemon fails; inventory.diagnostics lists it among the errors.
+       Test: crates/krab/tests/daemon_equals_local.rs::the_daemon_answers_like_no_daemon (the "two targets with one name" step)
+       Since: #306
 ```
 
 ### Generations and long polls
@@ -288,6 +301,18 @@ SRV-32 Every change on disk under the watched directories MUST eventually
        missed.
        Test: none
        Since: b3c122e
+
+SRV-47 A file that `from_file` read MUST be watched like an inventory file,
+       inside or outside the inventory directory, and a change to it MUST
+       re-render the targets that read it.
+       Test: crates/krab/tests/daemon_equals_local.rs::the_daemon_answers_like_no_daemon (the "change a file from_file reads" step)
+       Since: #306
+
+SRV-50 The watcher MUST start before the initial render; changes seen
+       during it MUST be applied once it is done.
+       Test: manual: a resolver that sleeps 4 s, a class change 2 s after the
+       first request, the daemon serves the new value afterwards
+       Since: #306
 ```
 
 ### Restart on configuration change
@@ -518,4 +543,3 @@ digest, doc_digest, ok, error?, labels, classes (count), inputs}`.
 | SRV-44 | #139 | Log lines carry no pid or build, and every build appends to one file (`paths.rs:68-70`). Fatal errors (bind failure, watcher start failure, a panicking accept loop) return to `main` and reach the log as a bare `error:` line from `eprintln!`, bypassing `tracing`. |
 | SRV-8 | #169 | The spawned `Child` is dropped (`client.rs:206`), so a daemon that exits while the spawning process lives becomes a zombie, and the client polls only the socket (`client.rs:145-149`), waiting the full 10 s after the child has died. |
 | SRV-15 | #170 | `socket_path` (`paths.rs:38-41`) does not check the length; with a long XDG_RUNTIME_DIR the bind fails with "path must be shorter than SUN_LEN" and every command waits 10 s before rendering locally. |
-| SRV-5 | #134 | No test compares the daemon and `--no-daemon` paths; every CLI integration test runs with `--no-daemon`. |
